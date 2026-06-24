@@ -11,78 +11,88 @@ else
 fi
 
 # ================================
+# Defaults para rclone / Drive
+# ================================
+: "${RCLONE_REMOTE:=gdrive}"
+: "${DRIVE_PATH:=backups-glpi}"
+
+# ================================
+# Config portátil de rclone
+# ================================
+RCLONE_CONFIG="./rclone.conf"
+
+if [ ! -f "$RCLONE_CONFIG" ]; then
+    echo "Falta $RCLONE_CONFIG"
+    echo ""
+    echo "Crealo con:"
+    echo "  rclone --config $RCLONE_CONFIG config"
+    echo ""
+    echo "Después elegí 'Google Drive' como tipo de almacenamiento."
+    echo "Cuando pregunte 'team_drive', pegá el ID del Shared Drive."
+    echo "Pasos detallados en INSTRUCTIONS.md"
+    exit 1
+fi
+
+# ================================
+# Verificar que rclone esté instalado
+# ================================
+if ! command -v rclone >/dev/null 2>&1; then
+    echo "rclone no está instalado. Instalalo con: sudo apt install rclone"
+    exit 1
+fi
+
+# ================================
+# Verificar que mysqldump exista
+# ================================
+if ! command -v mysqldump >/dev/null 2>&1; then
+    echo "mysqldump no está instalado."
+    exit 1
+fi
+
+# ================================
 # Preparar carpetas locales
 # ================================
 mkdir -p "$BACKUP_DIR"
-
-mkdir -p ~/.ssh
-chmod 700 ~/.ssh
-
-KEY_PATH="$HOME/.ssh/id_backup"
-
-# ================================
-# Generar llave si no existe
-# ================================
-if [ ! -f "$KEY_PATH" ]; then
-    echo "Generando llave SSH..."
-    ssh-keygen -t ed25519 -f "$KEY_PATH" -N "" >/dev/null
-fi
-
-# ================================
-# Instalar clave SSH si no está autorizada
-# ================================
-if ! ssh -p "$SSH_PORT" -i "$KEY_PATH" -o BatchMode=yes -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "exit" 2>/dev/null; then
-    echo "Instalando clave SSH en el servidor..."
-    ssh-copy-id -i "$KEY_PATH.pub" -p "$SSH_PORT" "$SSH_USER@$SSH_HOST"
-fi
 
 # ================================
 # Preparar nombres y rutas
 # ================================
 FECHA=$(date +"%Y-%m-%d_%H-%M-%S")
 
-ARCHIVO_REMOTO="$REMOTE_TMP_DIR/backup_$FECHA.sql"
-CRED="$REMOTE_TMP_DIR/mysqldump_$FECHA.cnf"
+ARCHIVO_LOCAL="$BACKUP_DIR/backup_$FECHA.sql"
+CRED="$BACKUP_DIR/mysqldump_$FECHA.cnf"
 
 # ================================
-# Ejecutar mysqldump remoto usando sh limpio
+# Crear archivo temporal de credenciales
 # ================================
-ssh -i "$KEY_PATH" -p "$SSH_PORT" -o StrictHostKeyChecking=no "$SSH_USER@$SSH_HOST" "env -i sh -s" <<EOF
-# Crear archivo de credenciales
-echo "[client]" > "$CRED"
-echo "user=$DB_USER" >> "$CRED"
-echo "password=$DB_PASS" >> "$CRED"
-echo "host=$DB_HOST" >> "$CRED"
-echo "port=$DB_PORT" >> "$CRED"
+(
+  umask 077
+  cat > "$CRED" <<EOF
+[client]
+user=$DB_USER
+password=$DB_PASS
+host=$DB_HOST
+port=$DB_PORT
+EOF
+)
 
-# Ejecutar mysqldump por TCP, sin SSL ni variables raras
-mysqldump --defaults-extra-file="$CRED" \
-          --ssl=0 \
-          "$DB_NAME" > "$ARCHIVO_REMOTO"
+# ================================
+# Ejecutar mysqldump LOCAL
+# ================================
+echo "Generando respaldo de la base de datos..."
+
+mysqldump \
+    --defaults-extra-file="$CRED" \
+    --ssl=0 \
+    "$DB_NAME" > "$ARCHIVO_LOCAL"
+
 STATUS=$?
 
+# Eliminar credenciales temporales
 rm -f "$CRED"
 
-exit \$STATUS
-EOF
-
-# ================================
-# Verificar éxito del dump
-# ================================
-if [ $? -ne 0 ]; then
-    echo "Error generando el respaldo remoto."
-    exit 1
-fi
-
-# ================================
-# Descargar respaldo
-# ================================
-ARCHIVO_LOCAL="$BACKUP_DIR/backup_$FECHA.sql"
-
-scp -i "$KEY_PATH" -P "$SSH_PORT" "$SSH_USER@$SSH_HOST:$ARCHIVO_REMOTO" "$ARCHIVO_LOCAL"
-
-if [ $? -ne 0 ]; then
-    echo "Error descargando el respaldo."
+if [ $STATUS -ne 0 ]; then
+    echo "Error generando el respaldo."
     exit 1
 fi
 
@@ -90,13 +100,35 @@ fi
 # Validar que NO esté vacío
 # ================================
 if [ ! -s "$ARCHIVO_LOCAL" ]; then
-    echo "El archivo descargado está vacío. Algo falló en el mysqldump."
+    echo "El archivo generado está vacío."
     exit 1
 fi
 
 # ================================
-# Limpiar archivo remoto
+# Comprimir respaldo local
 # ================================
-ssh -i "$KEY_PATH" -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "rm -f $ARCHIVO_REMOTO"
+echo "Comprimiendo respaldo..."
 
-echo "Respaldo completado correctamente: $ARCHIVO_LOCAL"
+gzip -f "$ARCHIVO_LOCAL"
+
+ARCHIVO_LOCAL_GZ="${ARCHIVO_LOCAL}.gz"
+
+if [ ! -s "$ARCHIVO_LOCAL_GZ" ]; then
+    echo "Error comprimiendo el respaldo."
+    exit 1
+fi
+
+# ================================
+# Subir a Google Drive
+# ================================
+echo "Subiendo a Google Drive: $RCLONE_REMOTE:$DRIVE_PATH/"
+
+rclone --config "$RCLONE_CONFIG" copy "$ARCHIVO_LOCAL_GZ" "$RCLONE_REMOTE:$DRIVE_PATH/"
+
+if [ $? -ne 0 ]; then
+    echo "Error subiendo el respaldo a Google Drive."
+    exit 1
+fi
+
+echo "Respaldo completado correctamente:"
+echo "$ARCHIVO_LOCAL_GZ"
